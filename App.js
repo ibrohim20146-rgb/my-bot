@@ -291,17 +291,19 @@
       if (r.error) { if (r.error.status === 401) localStorage.removeItem(TK); return null; }
       return { user: r.user };
     };
+    const finish = r => {
+      if (r.error) return { error: r.error };
+      localStorage.setItem(TK, r.token);
+      listeners.forEach(cb => cb('SIGNED_IN', { user: r.user }));
+      return { error: null };
+    };
     return {
       auth: {
-        signInWithOtp: async ({ email }) => { const r = await call('POST', '/api/send-code', { email, lang: I18N.lang }, false); return { error: r.error || null }; },
-        verifyOtp: async ({ email, token }) => {
-          const r = await call('POST', '/api/verify', { email, code: token }, false);
-          if (r.error) return { error: r.error };
-          localStorage.setItem(TK, r.token);
-          const s = { user: r.user };
-          listeners.forEach(cb => cb('SIGNED_IN', s));
-          return { error: null };
-        },
+        register: async d => { const r = await call('POST', '/api/register', Object.assign({ lang: I18N.lang }, d), false); return { error: r.error || null }; },
+        verifyRegister: async d => finish(await call('POST', '/api/register/verify', d, false)),
+        login: async d => finish(await call('POST', '/api/login', d, false)),
+        resetSend: async d => { const r = await call('POST', '/api/reset/send', Object.assign({ lang: I18N.lang }, d), false); return { error: r.error || null }; },
+        resetConfirm: async d => finish(await call('POST', '/api/reset/confirm', d, false)),
         signOut: async () => { await call('POST', '/api/logout'); localStorage.removeItem(TK); listeners.forEach(cb => cb('SIGNED_OUT', null)); },
         onAuthStateChange: cb => { listeners.push(cb); getSession().then(s => cb('INITIAL_SESSION', s)); }
       },
@@ -337,9 +339,37 @@
     const notify = (ev, s) => listeners.forEach(cb => cb(ev, s));
     return {
       auth: {
-        signInWithOtp: async () => ({ error: null }),
-        verifyOtp: async ({ email, token }) => {
-          if (token !== DEMO_CODE) return { error: { message: 'Token has expired or is invalid' } };
+        register: async d => {
+          const users = lsGet('cs_demo_users', {}), profs = lsGet('cs_demo_profiles', {});
+          if (users[d.email]) return { error: { code: 'email_taken', message: 'Email already registered' } };
+          if (Object.keys(profs).some(k => (profs[k].nickname || '').toLowerCase() === d.nick.toLowerCase())) return { error: { code: '23505', message: 'duplicate' } };
+          lsSet('cs_demo_pending', { [d.email]: d });
+          return { error: null };
+        },
+        verifyRegister: async ({ email, code }) => {
+          const d = (lsGet('cs_demo_pending', {}))[email];
+          if (!d || code !== DEMO_CODE) return { error: { message: 'Token has expired or is invalid' } };
+          const users = lsGet('cs_demo_users', {}), profs = lsGet('cs_demo_profiles', {});
+          users[email] = { password: d.password, nick: d.nick };
+          profs['demo:' + email] = { id: 'demo:' + email, nickname: d.nick, avatar: '😎', color: '#3dd68c', bio: '', data: {} };
+          lsSet('cs_demo_users', users); lsSet('cs_demo_profiles', profs);
+          const s = { user: { id: 'demo:' + email, email } };
+          lsSet('cs_demo_session', s); notify('SIGNED_IN', s);
+          return { error: null };
+        },
+        login: async ({ login, password }) => {
+          const users = lsGet('cs_demo_users', {});
+          const email = Object.keys(users).find(e => e === login.toLowerCase() || (users[e].nick || '').toLowerCase() === login.toLowerCase());
+          if (!email || users[email].password !== password) return { error: { code: 'bad_credentials', message: 'Wrong login or password' } };
+          const s = { user: { id: 'demo:' + email, email } };
+          lsSet('cs_demo_session', s); notify('SIGNED_IN', s);
+          return { error: null };
+        },
+        resetSend: async () => ({ error: null }),
+        resetConfirm: async ({ email, code, password }) => {
+          const users = lsGet('cs_demo_users', {});
+          if (code !== DEMO_CODE || !users[email]) return { error: { message: 'Token has expired or is invalid' } };
+          users[email].password = password; lsSet('cs_demo_users', users);
           const s = { user: { id: 'demo:' + email, email } };
           lsSet('cs_demo_session', s); notify('SIGNED_IN', s);
           return { error: null };
@@ -380,7 +410,7 @@
   const NICK_RE = /^[A-Za-z0-9_А-Яа-яЁё.-]{3,20}$/;
   const MAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-  let needNick = false, editing = false, authStep = 'email', pendingEmail = '', resendAt = 0, justSignedIn = false;
+  let needNick = false, editing = false, authTab = 'login', authStep = 'form', pendingEmail = '', pendingReg = null, resendAt = 0, justSignedIn = false;
   let formAvatar = AVATARS[0], formColor = COLORS[0];
 
   const avatarHTML = u => '<div class="avatar" style="background:' + esc(u.color) + '">' + esc(u.avatar) + '</div>';
@@ -389,6 +419,10 @@
     const m = ((e && e.message) || '').toLowerCase();
     if (e && e.code === '23505') return tr('acc_nick_taken');
     if (e && e.code === '23514') return tr('acc_nick_rule');
+    if (e && e.code === 'bad_credentials') return tr('acc_bad_login');
+    if (e && e.code === 'weak_password') return tr('acc_weak_pw');
+    if (e && e.code === 'email_taken') return tr('acc_email_taken');
+    if (e && e.code === 'bad_email') return tr('bad_email');
     if (m.includes('expired') || m.includes('invalid')) return tr('acc_bad_code');
     if (m.includes('rate limit') || m.includes('security purposes') || (e && e.status === 429)) return tr('acc_rate');
     if (m.includes('failed to fetch') || m.includes('network')) return tr('acc_network');
@@ -438,7 +472,7 @@
 
   async function handleSession(session) {
     if (!session) {
-      currentUser = null; userInfo = null; needNick = false; editing = false; authStep = 'email';
+      currentUser = null; userInfo = null; needNick = false; editing = false; authTab = 'login'; authStep = 'form';
       updateAuthUI(); renderRecords(); route();
       return;
     }
@@ -488,8 +522,80 @@
       '</form>';
   }
 
+  /* --- профиль в стиле Codeforces: рейтинг, ранг, статистика --- */
+  const RANKS = [
+    { min: 0, k: 'rk0' }, { min: 100, k: 'rk1' }, { min: 250, k: 'rk2' }, { min: 500, k: 'rk3' },
+    { min: 900, k: 'rk4' }, { min: 1400, k: 'rk5' }, { min: 2000, k: 'rk6' }
+  ];
+  function profileData() {
+    const p = getProgress(), tk = getTasks();
+    const lessons = (p.py || []).length + (p.cpp || []).length;
+    const lessonsAll = COURSES.py.lessons.length + COURSES.cpp.lessons.length;
+    const tasks = (tk.py || []).length + (tk.cpp || []).length;
+    const solvedIds = arSolved();
+    const solved = ARCHIVE.filter(x => solvedIds.includes(x.id));
+    const typing = store.get('cs_typing', { best: {}, history: [] });
+    const wpm = Math.max(0, ...Object.values(typing.best || {}).map(b => b.wpm || 0));
+    const quiz = store.get('cs_quiz', null);
+    const act = store.get('cs_activity', {});
+    const days = Object.keys(act).filter(k => act[k] > 0).length;
+    const rating = lessons * 10 + tasks * 2 + solved.reduce((a, x) => a + Math.round(x.rating / 20), 0) + (quiz ? Math.round(quiz.best / 2) : 0) + wpm;
+    let ri = 0; RANKS.forEach((r, i) => { if (rating >= r.min) ri = i; });
+    return { lessons, lessonsAll, tasks, solved, wpm, quiz, days, rating, ri };
+  }
+  function profileHTML() {
+    const u = userInfo, d = profileData();
+    const rank = RANKS[d.ri], next = RANKS[d.ri + 1];
+    const pct = next ? Math.round((d.rating - rank.min) / (next.min - rank.min) * 100) : 100;
+    const row = (k, v) => '<li><span>' + k + '</span><b>' + v + '</b></li>';
+    // решено по сложности (рейтинг задач, как на Codeforces)
+    const rates = Array.from(new Set(ARCHIVE.map(x => x.rating))).sort((a, b) => a - b);
+    const diffRows = rates.map(r => {
+      const all = ARCHIVE.filter(x => x.rating === r).length, ok = d.solved.filter(x => x.rating === r).length;
+      return '<li><span class="cf-rt">' + r + '</span><i class="cf-bar"><em style="width:' + Math.round(ok / all * 100) + '%"></em></i><b>' + ok + '/' + all + '</b></li>';
+    }).join('');
+    // решено по темам
+    const tagCount = {};
+    d.solved.forEach(x => x.tags.forEach(t => { tagCount[t] = (tagCount[t] || 0) + 1; }));
+    const tagTop = Object.keys(tagCount).sort((a, b) => tagCount[b] - tagCount[a]).slice(0, 8);
+    const tagRows = tagTop.length
+      ? '<div class="cf-tags">' + tagTop.map(t => '<span class="cf-tag">' + esc(arTag(t)) + ' <b>' + tagCount[t] + '</b></span>').join('') + '</div>'
+      : '<p class="cf-empty">' + tr('pr_no_solved') + ' <a href="#archive">' + tr('pr_to_archive') + '</a></p>';
+    return '<div class="cf">' +
+      '<aside class="card cf-side">' +
+        '<div class="cf-ava">' + avatarHTML(u) + '</div>' +
+        '<p class="cf-rank ' + rank.k + '">' + tr('rank_' + rank.k) + '</p>' +
+        '<h2 class="cf-name ' + rank.k + '">' + esc(u.name) + '</h2>' +
+        (u.bio ? '<p class="cf-bio">' + esc(u.bio) + '</p>' : '') +
+        '<div class="cf-rating"><span>' + tr('pr_rating') + '</span><b class="' + rank.k + '">' + d.rating + '</b></div>' +
+        '<div class="cf-prog" title="' + (next ? esc(tr('pr_next', tr('rank_' + next.k), next.min - d.rating)) : '') + '"><i class="' + rank.k + '" style="width:' + pct + '%"></i></div>' +
+        '<p class="cf-next">' + (next ? tr('pr_next', tr('rank_' + next.k), next.min - d.rating) : tr('pr_top')) + '</p>' +
+        '<p class="cf-mail">' + esc(u.email) + '</p>' +
+        '<div class="cf-actions"><button class="btn primary" data-act="edit">' + tr('pr_edit') + '</button>' +
+        '<button class="btn" data-act="logout">' + tr('pr_logout') + '</button></div>' +
+      '</aside>' +
+      '<div class="cf-main">' +
+        '<section class="card"><h3>' + tr('pr_stats') + '</h3><ul class="cf-list">' +
+          row(tr('pr_s_archive'), d.solved.length + ' / ' + ARCHIVE.length) +
+          row(tr('pr_s_lessons'), d.lessons + ' / ' + d.lessonsAll) +
+          row(tr('pr_s_tasks'), d.tasks) +
+          row(tr('pr_s_quiz'), d.quiz ? d.quiz.best + '%' : '—') +
+          row(tr('pr_s_wpm'), d.wpm || '—') +
+          row(tr('pr_s_days'), d.days) +
+        '</ul></section>' +
+        '<section class="card cf-act"><h3>' + tr('cal_title') + '</h3>' + activityHTML() + '</section>' +
+        '<section class="card"><h3>' + tr('pr_by_diff') + '</h3><ul class="cf-diff">' + diffRows + '</ul></section>' +
+        '<section class="card"><h3>' + tr('pr_by_tag') + '</h3>' + tagRows + '</section>' +
+        '<p class="cf-howto">' + tr('pr_howto') + '</p>' +
+      '</div></div>';
+  }
+
   function renderAuth() {
     const box = $('#auth-box');
+    const wide = !!(sb && userInfo && !needNick && !editing);       // профиль — широкая страница, формы — узкая карточка
+    box.className = wide ? 'profile-page' : 'card auth-box';
+    box.closest('.wrap').classList.toggle('narrow', !wide);
+    $('#login-title').hidden = wide;
     if (!sb) {
       $('#login-title').textContent = tr('login_title');
       box.innerHTML = '<div class="setup-box"><h3>' + tr('srv_down_t') + '</h3>' +
@@ -500,42 +606,56 @@
     if (userInfo && editing) { $('#login-title').textContent = tr('pf_edit_title'); box.innerHTML = profileForm(false); return; }
     if (userInfo) {
       $('#login-title').textContent = tr('pf_title');
-      const p = getProgress();
-      const done = (p.py || []).length + (p.cpp || []).length;
-      const typing = store.get('cs_typing', { best: {}, history: [] });
-      const wpm = Math.max(0, ...Object.values(typing.best).map(b => b.wpm));
-      const quiz = store.get('cs_quiz', null);
-      box.innerHTML =
-        '<div class="profile">' + avatarHTML(userInfo) + '<h2>' + esc(userInfo.name) + '</h2>' +
-        '<p class="sub">' + esc(userInfo.email) + '</p>' + (userInfo.bio ? '<p class="bio">' + esc(userInfo.bio) + '</p>' : '') +
-        '<div class="profile-stats"><div><b>' + done + '</b><span>' + tr('pr_lessons') + '</span></div><div><b>' + wpm + '</b><span>' + tr('st_wpm') + '</span></div><div><b>' + (quiz ? quiz.best + '%' : '—') + '</b><span>' + tr('pr_quiz') + '</span></div></div>' +
-        '<div class="activity"><h3>' + tr('cal_title') + '</h3>' + activityHTML() + '</div>' +
-        '<div class="profile-actions"><button class="btn primary" data-act="edit">' + tr('pr_edit') + '</button>' +
-        '<button class="btn" data-act="logout">' + tr('pr_logout') + '</button></div></div>';
+      box.innerHTML = profileHTML();
       const calSc = box.querySelector('.cal-scroll'); if (calSc) calSc.scrollLeft = calSc.scrollWidth;
       return;
     }
-    $('#login-title').textContent = tr('login_title');
-    if (authStep === 'code') {
-      box.innerHTML =
-        '<form class="auth-form" id="code-form" novalidate>' + demoNote() +
-        '<p class="auth-hint">' + tr('code_sent', esc(pendingEmail)) + '</p>' +
-        '<label>' + tr('code_label') + '<input name="code" class="code-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="one-time-code" required></label>' +
-        '<p class="auth-error" id="auth-error" role="alert"></p>' +
-        '<button class="btn primary" type="submit">' + tr('code_confirm') + '</button>' +
-        '<button class="btn ghost" type="button" id="resend-btn" data-act="resend">' + tr('code_resend') + '</button>' +
-        '<button class="btn ghost" type="button" data-act="change-email">' + tr('code_change') + '</button></form>';
-      tickResend();
-      const inp = $('input[name="code"]', box); if (inp) inp.focus();
-      return;
-    }
-    box.innerHTML =
-      '<form class="auth-form" id="email-form" novalidate>' + demoNote() +
-      '<p class="auth-hint">' + tr('mail_hint') + '</p>' +
-      '<label>' + tr('mail_label') + '<input name="email" type="email" autocomplete="email" placeholder="you@gmail.com" value="' + esc(pendingEmail) + '" required></label>' +
+    const tabs = authTab === 'forgot' ? '' :
+      '<div class="auth-tabs" role="tablist">' +
+      '<button type="button" role="tab" data-tab="login" class="' + (authTab === 'login' ? 'active' : '') + '">' + tr('login_title') + '</button>' +
+      '<button type="button" role="tab" data-tab="register" class="' + (authTab === 'register' ? 'active' : '') + '">' + tr('reg_title') + '</button></div>';
+    $('#login-title').textContent = authTab === 'register' ? tr('reg_title') : authTab === 'forgot' ? tr('fg_title') : tr('login_title');
+    const emailField = '<label>' + tr('mail_label') + '<input name="email" type="email" autocomplete="email" placeholder="you@gmail.com" value="' + esc(pendingEmail) + '" required></label>';
+    const pwField = (name, label, ac) => '<label>' + label + '<input name="' + name + '" type="password" autocomplete="' + ac + '" maxlength="100" required></label>';
+    const codeBlock = (extra, submitLabel) =>
+      '<p class="auth-hint">' + tr('code_sent', esc(pendingEmail)) + '</p>' +
+      '<label>' + tr('code_label') + '<input name="code" class="code-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="one-time-code" required></label>' + extra +
       '<p class="auth-error" id="auth-error" role="alert"></p>' +
-      '<button class="btn primary" type="submit">' + tr('mail_get') + '</button></form>' +
-      '<p class="auth-note">' + tr('auth_note') + '</p>';
+      '<button class="btn primary" type="submit">' + submitLabel + '</button>' +
+      '<button class="btn ghost" type="button" id="resend-btn" data-act="resend">' + tr('code_resend') + '</button>' +
+      '<button class="btn ghost" type="button" data-act="back-form">' + tr('code_back') + '</button>';
+    let html;
+    if (authTab === 'login') {
+      html = '<form class="auth-form" id="login-form" novalidate>' + demoNote() +
+        '<label>' + tr('lg_login') + '<input name="login" type="text" autocomplete="username" maxlength="120" required></label>' +
+        pwField('password', tr('pw_label'), 'current-password') +
+        '<p class="auth-error" id="auth-error" role="alert"></p>' +
+        '<button class="btn primary" type="submit">' + tr('login_title') + '</button>' +
+        '<button class="btn ghost" type="button" data-tab="forgot">' + tr('fg_link') + '</button></form>' +
+        '<p class="auth-note">' + tr('lg_note') + '</p>';
+    } else if (authTab === 'register') {
+      html = authStep === 'code'
+        ? '<form class="auth-form" id="reg-code-form" novalidate>' + demoNote() + codeBlock('', tr('reg_finish')) + '</form>'
+        : '<form class="auth-form" id="reg-form" novalidate>' + demoNote() +
+          '<label>' + tr('pf_nick') + '<input name="nick" type="text" maxlength="20" autocomplete="username" placeholder="' + tr('pf_nick_ph') + '" value="' + esc(pendingReg ? pendingReg.nick : '') + '" required></label>' +
+          emailField +
+          pwField('password', tr('pw_label'), 'new-password') +
+          pwField('password2', tr('pw_repeat'), 'new-password') +
+          '<p class="auth-hint">' + tr('reg_hint') + '</p>' +
+          '<p class="auth-error" id="auth-error" role="alert"></p>' +
+          '<button class="btn primary" type="submit">' + tr('reg_btn') + '</button></form>' +
+          '<p class="auth-note">' + tr('auth_note') + '</p>';
+    } else {   // forgot
+      html = authStep === 'code'
+        ? '<form class="auth-form" id="reset-code-form" novalidate>' + demoNote() + codeBlock(pwField('password', tr('pw_new'), 'new-password'), tr('fg_save')) + '</form>'
+        : '<form class="auth-form" id="reset-form" novalidate>' + demoNote() +
+          '<p class="auth-hint">' + tr('fg_hint') + '</p>' + emailField +
+          '<p class="auth-error" id="auth-error" role="alert"></p>' +
+          '<button class="btn primary" type="submit">' + tr('mail_get') + '</button>' +
+          '<button class="btn ghost" type="button" data-tab="login">' + tr('fg_back') + '</button></form>';
+    }
+    box.innerHTML = tabs + html;
+    if (authStep === 'code') { tickResend(); const inp = $('input[name="code"]', box); if (inp) inp.focus(); }
   }
 
   const setMsg = (msg, ok) => { const el = $('#auth-error'); if (el) { el.textContent = msg; el.className = ok ? 'auth-ok' : 'auth-error'; } };
@@ -552,8 +672,10 @@
     };
     upd(); resendTimer = setInterval(upd, 500);
   }
-  async function sendCode(email) {
-    const r = await sb.auth.signInWithOtp({ email, options: { shouldCreateUser: true } });
+  async function sendCode() {      // повторная отправка кода (регистрация или сброс пароля)
+    const r = authTab === 'register'
+      ? await sb.auth.register(pendingReg)
+      : await sb.auth.resetSend({ email: pendingEmail });
     if (!r.error) resendAt = Date.now() + 60000;
     return r.error;
   }
@@ -571,14 +693,16 @@
       $$('.color-dot').forEach(b => b.classList.toggle('active', b === co));
       $('#pf-av').style.background = formColor; return;
     }
+    const tab = e.target.closest('[data-tab]');
+    if (tab && sb && !userInfo) { authTab = tab.dataset.tab; authStep = 'form'; renderAuth(); return; }
     const b = e.target.closest('[data-act]');
     if (!b || !sb) return;
     const act = b.dataset.act;
     if (act === 'resend') {
       b.disabled = true;
-      const err = await sendCode(pendingEmail);
+      const err = await sendCode();
       if (err) { setMsg(authError(err)); b.disabled = false; } else { setMsg(tr('code_new_sent'), true); tickResend(); }
-    } else if (act === 'change-email') { authStep = 'email'; renderAuth(); }
+    } else if (act === 'back-form') { authStep = 'form'; renderAuth(); }
     else if (act === 'logout') { await sb.auth.signOut(); }
     else if (act === 'edit') { editing = true; formAvatar = userInfo.avatar; formColor = userInfo.color; renderAuth(); }
     else if (act === 'cancel-edit') { editing = false; renderAuth(); }
@@ -596,19 +720,50 @@
     const busy = v => { if (btn) btn.disabled = v; };
     busy(true);
     try {
-      if (f.id === 'email-form') {
+      if (f.id === 'login-form') {
+        const login = f.login.value.trim(), password = f.password.value;
+        if (!login || !password) return setMsg(tr('acc_bad_login'));
+        justSignedIn = true;
+        const r = await sb.auth.login({ login, password });
+        if (r.error) { justSignedIn = false; return setMsg(authError(r.error)); }
+      } else if (f.id === 'reg-form') {
+        const nick = f.nick.value.trim(), email = f.email.value.trim().toLowerCase(), password = f.password.value;
+        if (!NICK_RE.test(nick)) return setMsg(tr('acc_nick_rule'));
+        if (!MAIL_RE.test(email)) return setMsg(tr('bad_email'));
+        if (password.length < 8) return setMsg(tr('acc_weak_pw'));
+        if (password !== f.password2.value) return setMsg(tr('pw_mismatch'));
+        pendingReg = { nick, email, password }; pendingEmail = email;
+        const r = await sb.auth.register(pendingReg);
+        if (r.error) return setMsg(authError(r.error));
+        resendAt = Date.now() + 60000;
+        authStep = 'code'; renderAuth();
+      } else if (f.id === 'reg-code-form') {
+        const code = f.code.value.replace(/\D/g, '');
+        if (code.length < 6) return setMsg(tr('bad_code_len'));
+        justSignedIn = true;
+        const r = await sb.auth.verifyRegister({ email: pendingEmail, code });
+        if (r.error) {
+          justSignedIn = false;
+          if (r.error.code === '23505' || r.error.code === 'email_taken') { authStep = 'form'; renderAuth(); }
+          return setMsg(authError(r.error));
+        }
+        pendingReg = null; authStep = 'form'; authTab = 'login';
+      } else if (f.id === 'reset-form') {
         const email = f.email.value.trim().toLowerCase();
         if (!MAIL_RE.test(email)) return setMsg(tr('bad_email'));
-        const err = await sendCode(email);
-        if (err) return setMsg(authError(err));
-        pendingEmail = email; authStep = 'code'; renderAuth();
-      } else if (f.id === 'code-form') {
-        const token = f.code.value.replace(/\D/g, '');
-        if (token.length < 6) return setMsg(tr('bad_code_len'));
+        pendingEmail = email;
+        const r = await sb.auth.resetSend({ email });
+        if (r.error) return setMsg(authError(r.error));
+        resendAt = Date.now() + 60000;
+        authStep = 'code'; renderAuth();
+      } else if (f.id === 'reset-code-form') {
+        const code = f.code.value.replace(/\D/g, ''), password = f.password.value;
+        if (code.length < 6) return setMsg(tr('bad_code_len'));
+        if (password.length < 8) return setMsg(tr('acc_weak_pw'));
         justSignedIn = true;
-        const r = await sb.auth.verifyOtp({ email: pendingEmail, token, type: 'email' });
+        const r = await sb.auth.resetConfirm({ email: pendingEmail, code, password });
         if (r.error) { justSignedIn = false; return setMsg(authError(r.error)); }
-        authStep = 'email';
+        authStep = 'form'; authTab = 'login';
       } else if (f.id === 'profile-form') {
         const nick = f.nick.value.trim(), bio = f.bio.value.trim();
         if (!NICK_RE.test(nick)) return setMsg(tr('acc_nick_rule'));
