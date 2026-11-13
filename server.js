@@ -60,7 +60,7 @@ const sendPage = (req, res) => {
 };
 app.get('/', sendPage);
 app.get('/ProgForce.html', sendPage);
-const FILES = { '/App.js': 'App.js', '/Data.js': 'Data.js', '/Data.en.js': 'Data.en.js', '/Archive.js': 'Archive.js', '/I18n.js': 'I18n.js', '/ProgForce.css': 'ProgForce.css', '/Chatbot.js': 'Chatbot.js', '/Effects.js': 'Effects.js', '/server-config.js': 'server-config.js',
+const FILES = { '/App.js': 'App.js', '/Data.js': 'Data.js', '/Data.en.js': 'Data.en.js', '/Archive.js': 'Archive.js', '/I18n.js': 'I18n.js', '/ProgForce.css': 'ProgForce.css', '/Chatbot.js': 'Chatbot.js', '/Effects.js': 'Effects.js', '/Run.js': 'Run.js', '/server-config.js': 'server-config.js',
   '/favicon.svg': 'favicon.svg', '/favicon.png': 'favicon.png', '/favicon.ico': 'favicon.png', '/og-image.png': 'og-image.png',
   '/icons/icon-192.png': 'icons/icon-192.png', '/icons/icon-512.png': 'icons/icon-512.png', '/icons/icon-maskable-512.png': 'icons/icon-maskable-512.png' };
 Object.keys(FILES).forEach(p => app.get(p, (req, res) => res.sendFile(path.join(__dirname, FILES[p]))));
@@ -215,19 +215,22 @@ const AI_URL = process.env.CHAT_API_URL || (PROVIDER === 'groq'
 if (!PROVIDER) console.warn('⚠ Не задан GROQ_API_KEY (или ANTHROPIC_API_KEY) — чат-бот отвечать не будет.');
 else console.log('Чат-бот: ' + PROVIDER + ', модель ' + AI_MODEL);
 
-const CHAT_SYSTEM =
-  'You are the ProgForce Assistant, a smart and friendly programming tutor built into ProgForce — a website for learning C++ and Python. ' +
-  'The site has: step-by-step courses with code examples, a keyboard typing trainer, an archive of 60+ Codeforces-style problems (solutions are checked on the examples), cheat sheets / resources comparing the languages, and a quiz.\n' +
-  'Rules:\n' +
-  '- Reply in the same language the user writes in (the site language is given in each request; default to it if unclear).\n' +
-  '- Be concise and clear: explain step by step, use short code examples in fenced code blocks with a language tag.\n' +
-  '- When the user asks for code (even a trivial task like adding two numbers) in Python or C++, write complete, working code right away, then explain it briefly. If no language is named, show both Python and C++.\n' +
-  '- For archive problems, give hints and the idea first; give a full solution only if the user explicitly asks or has already tried.\n' +
-  '- Answer ANY question about IT: programming languages, algorithms, web development (HTML/CSS/JS, CMS such as WordPress, frameworks, databases, servers), computer science, competitive programming (Codeforces, LeetCode, olympiads), tools, careers and learning tips, and how to use this site. '
-    + 'Explain terms and abbreviations simply, with a short example when useful. Decline only clearly unrelated or harmful requests (politely, in one sentence).\n' +
-  '- Codeforces is an online platform with programming contests and a large archive of algorithmic problems; users solve them in C++, Python and other languages, and get a rating. The archive on this site is practice in that style.\n' +
-  '- The chat cannot render LaTeX. NEVER use LaTeX or math markup such as \\[ \\], \\( \\), $...$, \\log, \\frac, \\text. Write formulas in plain text, e.g. C = log2(M) bits per symbol, x^2, a/b, sqrt(n); put longer formulas or code in a fenced code block.\n' +
-  '- If you are not sure about something, say so instead of guessing.';
+const CHAT_SYSTEM = [
+  'You are ProgForce Assistant, a smart, friendly and patient programming tutor built into ProgForce, a website for learning C++ and Python.',
+  'The site has: step-by-step courses with code examples, a keyboard typing trainer, an archive of 60+ Codeforces-style problems, resources comparing languages, and a knowledge test.',
+  'Rules:',
+  '- Reply in the same language the user writes in. The site language is given in each request; use it if the language is unclear.',
+  '- First understand what the user really needs. If the question is vague, ask one short clarifying question.',
+  '- Explain step by step, from simple to complex. Use short, correct code examples in markdown code blocks with a language tag.',
+  '- When the user asks for code (even a trivial task), write complete working code right away, then explain it briefly. If no language is named, use Python.',
+  '- For archive problems, give a hint and the main idea first. Give a full solution only if the user explicitly asks or has already tried.',
+  '- If the user shows code with an error, find the exact cause, show the fixed line, and explain why it was wrong.',
+  '- Suggest the next small step or a short practice exercise when it helps learning.',
+  '- Answer any IT question: languages, algorithms, web development, databases, servers, computer science. Politely decline only unrelated or harmful requests, in one sentence.',
+  '- Explain terms and abbreviations simply, with a short example.',
+  '- The chat cannot render LaTeX. Never use LaTeX or math markup (no backslash commands, no dollar signs). Write formulas in plain text, and DO use Unicode math symbols freely: ∑ √ π ∞ ≤ ≥ ≠ ≈ → ← ± × ÷ ² ³ ½ α β. Examples: S = ∑ a[i], x ≤ y, √(a² + b²), C = log2(M).',
+  '- Keep answers concise. If you are not sure about something, say so instead of guessing.'
+].join('\n');
 
 const chatHits = {};
 app.post('/api/chat', async (req, res) => {
@@ -279,12 +282,151 @@ app.post('/api/chat', async (req, res) => {
 });
 
 
+/* ---------- запуск кода («Запуск», как custom invocation на Codeforces) ---------- */
+// RUN_MODE=remote (по умолчанию) — код уходит в онлайн-компилятор Wandbox: безопасно для вашего сервера.
+// RUN_MODE=local  — код компилируется и запускается на этом сервере (нужен g++ / python3). Выполняйте
+//                   чужой код локально только в Docker/на отдельной машине: процесс видит файлы сервера.
+const { spawn, spawnSync } = require('child_process');
+const os = require('os');
+const RUN_MODE = (process.env.RUN_MODE || 'remote').toLowerCase();
+const RUN_LOGIN = process.env.RUN_REQUIRE_LOGIN === '1';
+const RUN_TL = Math.min(+process.env.RUN_TIME_LIMIT_MS || 3000, 10000);
+const RUN_MEM_MB = +process.env.RUN_MEMORY_MB || 512;
+const RUN_MAX_OUT = 64 * 1024, RUN_MAX_CODE = 64 * 1024, RUN_MAX_IN = 100 * 1024;
+const IS_WIN = process.platform === 'win32';
+const CAN_UNSHARE = !IS_WIN && RUN_MODE === 'local' && (() => { try { return spawnSync('unshare', ['-rn', 'true']).status === 0; } catch (e) { return false; } })();
+if (RUN_MODE === 'local') console.log('Запуск кода: локально' + (CAN_UNSHARE ? ' (без сети)' : ' (⚠ изоляция сети недоступна)'));
+else console.log('Запуск кода: онлайн-компилятор Wandbox');
+
+function runProc(cmd, args, o) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    let out = '', err = '', over = false, timedOut = false, done = false;
+    let ch;
+    try { ch = spawn(cmd, args, { cwd: o.cwd, env: o.env, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (e) { return resolve({ code: -1, signal: null, stdout: '', stderr: String(e.message), spawnError: true, ms: 0 }); }
+    const finish = (code, signal, extra) => {
+      if (done) return; done = true; clearTimeout(timer);
+      resolve(Object.assign({ code, signal, stdout: out, stderr: err, timedOut, over, ms: Date.now() - t0 }, extra));
+    };
+    const timer = setTimeout(() => { timedOut = true; try { ch.kill('SIGKILL'); } catch (e) {} }, o.timeout);
+    ch.stdout.on('data', d => { if (out.length < RUN_MAX_OUT) out += d.toString('utf8'); else { over = true; try { ch.kill('SIGKILL'); } catch (e) {} } });
+    ch.stderr.on('data', d => { if (err.length < RUN_MAX_OUT) err += d.toString('utf8'); });
+    ch.on('error', e => { err += String(e.message); finish(-1, null, { spawnError: true }); });
+    ch.on('close', (code, signal) => finish(code, signal));
+    ch.stdin.on('error', () => {});
+    ch.stdin.end(o.input || '');
+  });
+}
+
+async function runLocal(lang, code, input) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf-run-'));
+  const env = { PATH: process.env.PATH || '/usr/bin:/bin', LANG: 'C.UTF-8', HOME: dir, TMPDIR: dir };
+  try {
+    let cmd, args;
+    if (lang === 'cpp') {
+      fs.writeFileSync(path.join(dir, 'main.cpp'), code);
+      const exe = IS_WIN ? 'main.exe' : 'main';
+      const c = await runProc('g++', ['-O2', '-std=c++17', '-pipe', '-o', exe, 'main.cpp'], { cwd: dir, env, timeout: 20000, input: '' });
+      if (c.spawnError) return { error: 'no_compiler' };
+      if (c.code !== 0 || c.timedOut) return { verdict: 'ce', stdout: '', stderr: '', compile: (c.stderr || c.stdout || 'compilation failed').slice(0, 20000), exit: c.code, time: null };
+      cmd = path.join(dir, exe); args = [];
+    } else {
+      fs.writeFileSync(path.join(dir, 'main.py'), code);
+      cmd = IS_WIN ? 'python' : 'python3'; args = ['-I', 'main.py'];
+    }
+    if (!IS_WIN) {
+      args = ['-c', 'ulimit -c 0; ulimit -f 4096; ulimit -v ' + (RUN_MEM_MB * 1024) + '; exec "$@"', 'sh', cmd].concat(args);
+      cmd = 'sh';
+      if (CAN_UNSHARE) { args = ['-rn', 'sh'].concat(args); cmd = 'unshare'; }
+    }
+    const r = await runProc(cmd, args, { cwd: dir, env, timeout: RUN_TL, input });
+    if (r.spawnError) return { error: lang === 'py' ? 'no_python' : 'run_failed' };
+    let verdict = 'ok';
+    if (r.timedOut) verdict = 'tle';
+    else if (r.over) verdict = 'ole';
+    else if (r.code !== 0 || r.signal) verdict = 're';
+    return { verdict, stdout: r.stdout, stderr: r.stderr, compile: '', exit: r.signal || r.code, time: r.ms };
+  } finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {} }
+}
+
+let wbList = null, wbAt = 0;
+async function wandboxCompiler(lang) {
+  const fallback = lang === 'cpp' ? 'gcc-head' : 'cpython-head';
+  try {
+    if (!wbList || Date.now() - wbAt > 6 * 3600e3) {
+      const r = await fetch('https://wandbox.org/api/list.json', { signal: AbortSignal.timeout(10000) });
+      if (!r.ok) throw new Error('list');
+      wbList = await r.json(); wbAt = Date.now();
+    }
+    const want = lang === 'cpp' ? 'C++' : 'Python';
+    const ver = n => (n.match(/\d+(\.\d+)*/) || ['0'])[0].split('.').map(Number);
+    const cmp = (a, b) => { const x = ver(a), y = ver(b); for (let i = 0; i < 4; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); } return 0; };
+    const names = wbList.filter(c => c.language === want && (lang === 'cpp' ? /^gcc-\d/.test(c.name) : /^cpython-\d/.test(c.name))).map(c => c.name).sort(cmp);
+    return names.length ? names[names.length - 1] : fallback;
+  } catch (e) { return fallback; }
+}
+
+async function runRemote(lang, code, input) {
+  const compiler = await wandboxCompiler(lang);
+  const body = { compiler, code, stdin: input, save: false };
+  if (lang === 'cpp') body['compiler-option-raw'] = '-O2\n-std=gnu++17';
+  const t0 = Date.now();
+  let r;
+  try { r = await fetch('https://wandbox.org/api/compile.json', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) }); }
+  catch (e) { return { error: 'remote_down' }; }
+  if (!r.ok) return { error: r.status === 429 ? 'busy' : 'remote_down' };
+  const d = await r.json().catch(() => null);
+  if (!d) return { error: 'remote_down' };
+  const status = String(d.status == null ? '' : d.status), sig = String(d.signal || '');
+  const stdout = String(d.program_output || ''), stderr = String(d.program_error || '');
+  const cmsg = String(d.compiler_error || d.compiler_message || '');
+  const ran = d.program_message !== undefined && d.program_message !== '' || stdout !== '' || stderr !== '';
+  let verdict = 'ok';
+  if (status === '0' && !sig) verdict = 'ok';
+  else if (!ran && lang === 'cpp' && cmsg) verdict = 'ce';
+  else if (/kill|timeout/i.test(sig)) verdict = 'tle';
+  else verdict = 're';
+  if (lang === 'py' && verdict === 're' && !ran && cmsg) verdict = 're';
+  return { verdict, stdout, stderr, compile: verdict === 'ce' ? cmsg : '', exit: sig || status, time: null };
+}
+
+const runHits = {};
+let runActive = 0;
+const runGuard = RUN_LOGIN ? [auth] : [];
+app.post('/api/run', runGuard, async (req, res) => {
+  const b = req.body || {};
+  const lang = b.lang === 'py' ? 'py' : (b.lang === 'cpp' ? 'cpp' : '');
+  const code = typeof b.code === 'string' ? b.code : '';
+  const input = typeof b.input === 'string' ? b.input : '';
+  if (!lang || !code.trim()) return fail(res, 400, 'bad_request', 'Invalid request');
+  if (code.length > RUN_MAX_CODE || input.length > RUN_MAX_IN) return fail(res, 413, 'too_big', 'Too large');
+
+  const now = Date.now();
+  const hits = (runHits[req.ip] || []).filter(t => now - t < 600e3);
+  if (hits.length >= 40) return fail(res, 429, 'rate', 'rate limit');
+  if (runActive >= (RUN_MODE === 'local' ? 3 : 6)) return fail(res, 429, 'busy', 'busy');
+  runHits[req.ip] = hits.concat(now);
+
+  runActive++;
+  try {
+    const r = RUN_MODE === 'local' ? await runLocal(lang, code, input) : await runRemote(lang, code, input);
+    if (r.error) return fail(res, r.error === 'busy' ? 429 : 502, r.error, 'Run service error');
+    res.json(r);
+  } catch (e) {
+    console.error('Run error:', e.message);
+    fail(res, 500, 'run_failed', 'Run error');
+  } finally { runActive--; }
+});
+
+
 // чистка старых кодов и сессий раз в час
 setInterval(() => {
   const now = Date.now();
   Object.keys(db.codes).forEach(k => { if (now > db.codes[k].exp) delete db.codes[k]; });
   Object.keys(db.sessions).forEach(k => { if (now - db.sessions[k].created > 90 * 86400e3) delete db.sessions[k]; });
   Object.keys(chatHits).forEach(k => { chatHits[k] = chatHits[k].filter(t => now - t < 86400e3); if (!chatHits[k].length) delete chatHits[k]; });
+  Object.keys(runHits).forEach(k => { runHits[k] = runHits[k].filter(t => now - t < 600e3); if (!runHits[k].length) delete runHits[k]; });
   save();
 }, 3600e3).unref();
 
